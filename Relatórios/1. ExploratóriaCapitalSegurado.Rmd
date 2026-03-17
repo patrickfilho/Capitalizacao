@@ -1,0 +1,275 @@
+---
+title: "Analise Exploratória - Vida Individual"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+    fig_width: 5
+    fig_height: 4
+    css: "C:/Users/Patrick/Desktop/Repartição Individual/Estilos/estilos.css"
+---
+
+```{r, include=FALSE}
+# Carregando os pacotes
+library(arrow)
+library(data.table)
+library(dplyr)
+library(tidyverse)
+library(plotly)
+library(survival)
+library(ggsurvfit)
+library(flextable)
+library(DT)
+library(survminer)
+library(gridExtra)
+library(lnmixsurv)
+library(ggplot2)
+library(rlang)
+library(lubridate)
+library(here)
+library(scales)
+
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, echo = FALSE, fig.align = 'left')
+
+
+dataset <- readRDS("C:/Users/Patrick/Desktop/Repartição Individual/dataset_clean_v2.rds")
+
+# 1. Função de Risco Empírico (Mantida conforme sua versão de VG)
+tx.emp <- function(t, s, cat) {
+  seq_time <- 1:length(t)
+  aux <- NULL
+  for (i in 2:length(seq_time)) {
+    aux <- c(aux, 
+             (s[seq_time[i - 1]] - s[seq_time[i]]) /
+               ((t[seq_time[i]] - t[seq_time[i - 1]]) * s[seq_time[i - 1]]))
+  }
+  return(bind_rows(tibble(time = 0, hazard = 0, strata = cat),
+                   tibble(time = t[-1], hazard = aux, strata = cat)))
+}
+
+# 2. Função de Cálculo de Persistência Ponderada
+calcular_analise_completa <- function(dados, var_grupo) {
+  var_sym <- ensym(var_grupo)
+  dados <- dados %>% mutate(!!var_sym := as.character(!!var_sym))
+  grupos <- unique(pull(dados, !!var_sym))
+  
+  resultados <- map_dfr(grupos, function(g) {
+    dados_grupo <- dados %>% filter(!!var_sym == g)
+    max_tempo <- max(dados_grupo$tempo_mes, na.rm = TRUE)
+    
+    df_base <- dados_grupo %>%
+      group_by(tempo_mes) %>%
+      summarise(
+        Total = sum(capitalSeguradoPrevisto, na.rm = TRUE),
+        Cancelados = sum(capitalSeguradoPrevisto[status == "Cancelado"], na.rm = TRUE),
+        .groups = "drop"
+      ) %>%
+      complete(tempo_mes = 0:max_tempo, fill = list(Total = 0, Cancelados = 0)) %>%
+      arrange(tempo_mes) %>%
+      mutate(
+        Expostos = rev(cumsum(rev(Total))),
+        Desistencia = ifelse(Expostos == 0, 0, Cancelados / Expostos),
+        Persistencia = cumprod(1 - Desistencia),
+        Persistencia = ifelse(tempo_mes == 0, 1, Persistencia),
+        grupo_val = as.character(g)
+      )
+    
+    risco <- tx.emp(df_base$tempo_mes, df_base$Persistencia, g)
+    
+    df_base %>% 
+      left_join(risco, by = c("tempo_mes" = "time")) %>%
+      rename(!!var_sym := grupo_val)
+  })
+  return(resultados)
+}
+
+# 3. Função de Plot Dual (Persistência + Risco) com Legenda Inferior
+plot_interativo_combinado <- function(df, var_grupo, label_grupo) {
+  # Plot 1: S(t)
+  p1 <- ggplot(df, aes(x = tempo_mes, y = Persistencia, color = !!sym(var_grupo))) +
+    geom_step() +
+    scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+    labs(x = "Tempo (meses)", y = "S(t) - Capital", color = label_grupo) +
+    theme_classic()
+
+  # Plot 2: h(t)
+  p2 <- ggplot(df, aes(x = tempo_mes, y = hazard, color = !!sym(var_grupo))) +
+    geom_line() +
+    labs(x = "Tempo (meses)", y = "Taxa de Risco (h(t))", color = label_grupo) +
+    theme_classic()
+
+  plt1 <- ggplotly(p1)
+  plt2 <- ggplotly(p2)
+
+  subplot(plt1, plotly::style(plt2, showlegend = FALSE), 
+          titleX = TRUE, titleY = TRUE, margin = 0.05) %>%
+    layout(
+      hovermode = "closest",
+      xaxis = list(showspikes = TRUE, spikemode = "across", spikedash = "dash", spikecolor = "grey"),
+      # Posicionamento da legenda na parte de baixo
+      legend = list(orientation = "h", x = 0.5, xanchor = "center", y = -0.3),
+      margin = list(b = 100)
+    )
+}
+
+# 4. Nova Função: Resumo de Capital (Bar Plot + Flextable)
+resumo_categoria_capital <- function(dados, var_grupo, label_grupo) {
+  # Cálculo ponderado
+  resumo <- dados %>%
+    group_by(!!sym(var_grupo)) %>%
+    summarise(Capital_Total = sum(capitalSeguradoPrevisto, na.rm = TRUE), .groups = "drop") %>%
+    mutate(Porcentagem = round(Capital_Total / sum(Capital_Total) * 100, 2)) %>%
+    arrange(desc(Capital_Total))
+
+  # Gráfico de Barras
+  p <- ggplot(resumo, aes(x = reorder(!!sym(var_grupo), -Capital_Total), y = Capital_Total, fill = !!sym(var_grupo))) +
+    geom_bar(stat = "identity") +
+    scale_y_continuous(labels = scales::label_number(big.mark = ".", decimal.mark = ",")) +
+    labs(y = "Capital Segurado", x = label_grupo) +
+    theme_classic() +
+    theme(legend.position = "none")
+
+  # Tabela Flextable
+  ft <- flextable(resumo %>% rename(Categoria = 1, `Capital Total` = 2, `Porcentagem (%)` = 3)) %>%
+    colformat_double(j = "Capital Total", big.mark = ".", decimal.mark = ",", digits = 0) %>%
+    width(width = 1.5) %>%
+    bold(part = "header") %>%
+    theme_box() %>%
+    align(align = "center", part = "all")
+
+  return(list(plot = ggplotly(p), table = ft))
+}
+```
+
+# Análise {.tabset .tabset-fade .tabset-pills}
+
+## Pré-Status
+
+```{r fig.width=10, fig.height=6}
+res <- resumo_categoria_capital(dataset, "statusItemContratado", "Status do Item")
+res$plot
+res$table
+```
+
+## Status
+
+```{r fig.width=10, fig.height=6}
+# Forçamos Status para caractere para não gerar escala de cor contínua
+dataset_status <- dataset %>% mutate(Status = as.character(Status))
+res <- resumo_categoria_capital(dataset_status, "Status", "Status (Evento)")
+res$plot
+res$table
+```
+
+## Sexo do Cliente
+```{r fig.width=10, fig.height=6}
+res <- resumo_categoria_capital(dataset, "sexoCliente", "Sexo do Cliente")
+res$plot
+res$table
+```
+
+## Categoria do Cliente
+```{r fig.width=10, fig.height=6}
+res <- resumo_categoria_capital(dataset, "categoriaCliente", "Categoria do Cliente")
+res$plot
+res$table
+```
+
+## Forma da Cobrança
+```{r fig.width=10, fig.height=6}
+res <- resumo_categoria_capital(dataset, "formaCobranca", "Forma de Cobrança")
+res$plot
+res$table
+```
+
+## Periodicidade da Cobrança
+```{r fig.width=10, fig.height=6}
+res <- resumo_categoria_capital(dataset, "periodicidadeCobranca", "Periodicidade")
+res$plot
+res$table
+```
+
+## Nome do Produto
+```{r fig.width=10, fig.height=6}
+res <- resumo_categoria_capital(dataset, "produtoNome", "Nome do Produto")
+res$plot
+res$table
+```
+
+## Descrição da Carteira
+```{r fig.width=10, fig.height=6}
+res <- resumo_categoria_capital(dataset, "carteiraDescricao", "Carteira")
+res$plot
+res$table
+```
+## Regime Financeiro
+```{r fig.width=10, fig.height=6}
+res <- resumo_categoria_capital(dataset, "regimeFinanceiro", "Regime Financeiro")
+res$plot
+res$table
+```
+
+## Descrição do Ramo
+```{r fig.width=10, fig.height=6}
+res <- resumo_categoria_capital(dataset, "ramoDescricao", "Descrição do Ramo")
+res$plot
+res$table
+```
+## Cobertura Agrupamento
+```{r fig.width=10, fig.height=6}
+res <- resumo_categoria_capital(dataset, "coberturaAgrupamento", "Cobertura Agrupamento")
+res$plot
+res$table
+```
+
+# Persistência {.tabset .tabset-fade .tabset-pills}
+
+## Sexo do Cliente
+```{r fig.width=10, fig.height=6}
+res_prestat <- calcular_analise_completa(dataset, sexoCliente)
+plot_interativo_combinado(res_prestat, "sexoCliente", "Sexo do Cliente")
+```
+
+## Categoria do Cliente
+```{r fig.width=10, fig.height=6}
+res_prestat <- calcular_analise_completa(dataset, categoriaCliente)
+plot_interativo_combinado(res_prestat, "categoriaCliente", "Categoria do Cliente")
+```
+
+## Forma da Cobrança
+```{r fig.width=10, fig.height=6}
+res_prestat <- calcular_analise_completa(dataset, formaCobranca)
+plot_interativo_combinado(res_prestat, "formaCobranca", "Forma  de cobrança")
+```
+
+## Periodicidade da Cobrança
+```{r fig.width=10, fig.height=6}
+res_prestat <- calcular_analise_completa(dataset, periodicidadeCobranca)
+plot_interativo_combinado(res_prestat, "periodicidadeCobranca", "Periodicidade da cobrança")
+```
+
+## Descrição da Carteira
+```{r fig.width=10, fig.height=6}
+res_prestat <- calcular_analise_completa(dataset, carteiraDescricao)
+plot_interativo_combinado(res_prestat,"carteiraDescricao", "Descrição da carteira")
+```
+
+## Regime Financeiro
+```{r fig.width=10, fig.height=6}
+res_prestat <- calcular_analise_completa(dataset, regimeFinanceiro)
+plot_interativo_combinado(res_prestat,"regimeFinanceiro", "Regime Financeiro")
+```
+
+## Descrição do Ramo
+```{r fig.width=10, fig.height=6}
+res_prestat <- calcular_analise_completa(dataset, ramoDescricao)
+plot_interativo_combinado(res_prestat,"ramoDescricao", "Descrição do Ramo")
+```
+
+## Cobertura Agrupamento
+```{r fig.width=10, fig.height=6}
+res_prestat <- calcular_analise_completa(dataset, coberturaAgrupamento)
+plot_interativo_combinado(res_prestat,"coberturaAgrupamento", "Cobertura Agrupamento")
+```
