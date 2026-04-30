@@ -1,0 +1,224 @@
+---
+title: "Preparação de Dados - Persistência de Capitalização"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+    fig_width: 5
+    fig_height: 4
+    css: "C:/Users/Patrick/Desktop/Capitalizacao - MAG 2025/Estilos/estilos.css"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## Configuração Inicial e Leitura dos Dados
+
+Primeiro, carregamos os pacotes necessários e consolidamos os arquivos `.parquet` originais em uma única base.
+```{r bibliotecas-e-leitura}
+library(arrow)
+library(dplyr)
+library(lubridate)
+library(tidyr)
+library(here)
+library(readr)
+library(tidyverse)
+library(purrr)
+
+# Definindo caminhos
+pasta <- "C:/Users/Patrick/Desktop/Capitalizacao - MAG 2025/Mongeral - 2026-02-11 - Persistência - Capitalização VI - v3"
+arquivos <- list.files(pasta, pattern = "parquet$", full.names = TRUE)
+
+# Lendo e unindo todos os arquivos parquet, depois salvando uma cópia unificada
+base <- map_dfr(arquivos, read_parquet)
+write_parquet(base, "C:/Users/Patrick/Desktop/Capitalizacao - MAG 2025/base_original.parquet")
+
+# Carregando a base unificada para iniciar os tratamentos
+base <- read_parquet("C:/Users/Patrick/Desktop/Capitalizacao - MAG 2025/base_original.parquet")
+```
+
+## Passo 1: Verificar número de linhas original
+
+Vamos conferir o número de linhas na base sem nenhum tratamento.
+```{r passo-1}
+total_linhas <- nrow(base)
+cat("Total de linhas:", total_linhas)
+```
+A base bruta contém aproximadamente 6.154.928 observações.
+
+## Passo 2: Remoção de Duplicatas
+
+Removemos as duplicatas com `distinct` para entender se há alguma linha totalmente igual na base.
+```{r passo-2}
+base_unica <- base %>% 
+  distinct()
+
+linhas_removidas <- nrow(base) - nrow(base_unica)
+cat("Linhas duplicadas removidas:", linhas_removidas, "\n")
+```
+Não existem mais duplicatas na base.
+
+## Passo 3: Colunas da Base
+
+Abaixo estão os nomes de todas as colunas presentes no conjunto de dados.
+```{r passo-3}
+colunas <- names(base)
+print(colunas)
+```
+
+## Passo 4: Valores Únicos por Coluna
+
+Queremos entender a quantidade de  valores únicos para cada variável.
+```{r passo-4}
+valores_unicos <- base %>%
+  summarise(across(everything(), n_distinct)) %>%
+  collect()
+
+valores_unicos_longo <- valores_unicos %>% 
+  pivot_longer(everything(), names_to = "coluna", values_to = "qtd_unicos")
+
+print(n = 33,  valores_unicos_longo)
+```
+Assim, nosso objetivo é tomar o maior `tempoCasa` para cada `codigoItemContratado` e chegar a 181.185 linhas.
+
+## Passo 5: Extremos de tempoCasa
+
+Avaliamos os valores mínimo e máximo da variável `tempoCasa`.
+```{r passo-5}
+min_max_tempo <- base %>%
+  summarise(
+    min_tempo = min(tempoCasa, na.rm = TRUE),
+    max_tempo = max(tempoCasa, na.rm = TRUE)
+  ) %>%
+  collect()
+
+print("Mínimo e Máximo de tempoCasa:")
+print(min_max_tempo)
+```
+
+## Passo 6: Filtrar maior tempoCasa por item
+
+Obteremos o maior valor de `tempoCasa` para cada `codigoItemContratado` (o comportamento padrão mantém os empates). 
+```{r passo-6}
+base_max_tempo <- base_unica %>%
+  group_by(codigoItemContratado) %>%
+  slice_max(order_by = tempoCasa, n = 1) %>% 
+  ungroup()
+
+linhas_finais <- nrow(base_max_tempo)
+cat("Total de linhas após o filtro do maior tempoCasa:", linhas_finais, "\n")
+```
+Chegamos no número previsto de 181.185 linhas. Isso significa que os `codigoItemContratado` não têm mais de uma linha com o mesmo valor máximo de `tempoCasa`.
+
+## Passo 7: Contagem para os últimos 10 anos (<= 120 ou 121 meses)
+
+Avaliando o impacto de filtrar o tempo de casa para considerar apenas a última década.
+```{r passo-7}
+qtd_121 <- base_max_tempo %>%
+  filter(tempoCasa <= 121) %>%
+  nrow()
+
+qtd_120 <- base_max_tempo %>%
+  filter(tempoCasa <= 120) %>%
+  nrow()
+
+cat("Total até 121 meses:", qtd_121, "\n")
+cat("Total até 120 meses:", qtd_120, "\n")
+cat("Registros com exatos 121 meses:", qtd_121 - qtd_120, "\n")
+```
+
+## Passo 8: Contagem de itens com vigência pós-2015
+
+Comparando com uma regra de corte baseada na `dataInicioVigenciaCobertura` (a partir de 01/06/2015). Notamos que o número difere da abordagem de corte por meses (Passo 7).
+```{r passo-8}
+qtd_pos_2015 <- base_max_tempo %>%
+  filter(dataInicioVigenciaCobertura >= as.Date("2015-06-01")) %>%
+  nrow()
+
+cat("Quantidade de itens com vigência a partir de 01/06/2015:", qtd_pos_2015, "\n")
+
+# Verificando o sumário da variável tempoCasa com essa condição
+base_max_tempo_filtrada <- base_max_tempo %>%
+  filter(dataInicioVigenciaCobertura >= as.Date("2015-06-01"))
+
+min_max_tempo_filtro <- base_max_tempo_filtrada %>%
+  summarise(
+    min_tempo = min(tempoCasa, na.rm = TRUE),
+    max_tempo = max(tempoCasa, na.rm = TRUE)
+  ) %>%
+  collect()
+
+print("Mínimo e Máximo de tempoCasa após filtro de data:")
+print(min_max_tempo_filtro)
+```
+Precisamos definir se o tratamento será por `tempoCasa` (<= 120 ou 121) ou por `dataInicioVigenciaCobertura` (>= 01/06/2015). Por enquanto, continuaremos usando a `base_max_tempo`.
+
+## Passo 9: Tratamento do Status (Censurado vs Cancelado)
+
+Transformamos a variável `statusCompetencia` consolidando-a em duas categorias (Cancelado ou Censurado) e removendo os status que não entram na conta de persistência.
+```{r passo-9}
+# Listas de mapeamento
+status_remove <- c(
+  "TRANSFERÊNCIA - C15", "CONTRATO ANULADO - C16", "PAGAMENTO ÚNICO - D01",
+  "REMIDO - D02", "PRAZO CUMPRIDO - C06", "ENCERRAMENTO APÓLICE - C13"
+)
+
+status_ativos <- c(
+  "ATIVA EM DIA - A00", "ATIVA 1 ATRASO - A01", "ATIVA 2 ATRASOS - A02",
+  "ATIVA 3 ATRASOS - A03", "ATIVA 4 ATRASOS - A04", "ATIVA 5 ATRASOS - A05"
+)
+
+status_sinistros <- c(
+  "ÓBITO - C03", "AUXÍLIO FUNERAL - B07", "DIT/DMH - B10", "DOENÇAS GRAVES - B21",
+  "INVALIDEZ (PAGAMENTO ÚNICO IPA) - B11", "INVALIDEZ (PAGAMENTO ÚNICO IPD) - B09",
+  "LIQUIDAÇÃO ESPECIAL BENEFÍCIO - B05", "PECÚLIO - B03", "PENSÃO - B01",
+  "PERDA DE HABILITAÇÃO DE VÔO / PAGAMENTO ÚNICA - B16", "RENDA INVALIDEZ - B18",
+  "BENEFÍCIO NEGADO - C10", "RESGATE - B02"
+)
+
+status_cancelados <- c(
+  "CANCELADO PELA REGULAÇÃO - C22", "CANCELADO POR DEPENDÊNCIA - C21",
+  "INADIMPLÊNCIA - C01", "DESISTÊNCIA - C05", "ÓRGÃO CONSIGNANTE CANCELADO"
+)
+
+# Criação da coluna 'status' na base de modelagem
+base_modelagem_v0 <- base_max_tempo %>%
+  filter(!statusCompetencia %in% status_remove) %>%
+  mutate(
+    status = case_when(
+      statusCompetencia %in% c(status_ativos, status_sinistros) ~ "Censura",
+      statusCompetencia %in% status_cancelados                  ~ "Cancelado",
+      TRUE                                                      ~ "Cancelado" 
+    )
+  )
+
+novo_total_linhas <- nrow(base_modelagem_v0)
+cat("Número de linhas após filtros de status (base_modelagem):", novo_total_linhas, "\n")
+```
+O total de linhas caiu de 181.185 para 171.155 ao remover os status que não compõem a análise.
+
+## Passo 10: Distribuição de Status
+
+Analisando o percentual final da nossa variável resposta de persistência.
+```{r passo-10}
+cat("Distribuição Censurados x Cancelados (status):\n")
+base_modelagem_v0 %>% 
+  count(status) %>% 
+  mutate(percentual = round(n / sum(n) * 100, 2)) %>% 
+  print()
+```
+
+---
+
+## Próximos Passos (11 a 15)
+
+As etapas a seguir estão mapeadas para o desenvolvimento contínuo do modelo de persistência:
+
+1. **Passo 11:** Definir qual abordagem de corte temporal será utilizada (`tempoCasa` de 120 ou 121 meses *vs* `dataInicioVigenciaCobertura`).
+2. **Passo 12:** Criar uma nova coluna convertendo a variável de `status` textual ("Censura" / "Cancelado") para binária (`0` ou `1`), viabilizando a modelagem.
+3. **Passo 13:** Observar a nova porcentagem de Censurados e Cancelados após a aplicação do corte temporal definido no Passo 11.
+4. **Passo 14:** Realizar a seleção de características, definindo quais colunas/covariáveis farão parte do modelo final.
+5. **Passo 15:** Executar a análise exploratória de dados, construindo gráficos e levantando a curva de persistência empírica (Kaplan-Meier).
